@@ -1,0 +1,459 @@
+---
+title: "Modelling the Serie A football data"
+description: | 
+  Statistical Methods in Data Science II & Lab
+date: July 20 2021
+author:
+  - name: "Domenico Mattia Cinque 1784965"
+output: radix::radix_article
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(R2jags)
+library(LaplacesDemon)
+require(reshape2)
+library(viridis)
+set.seed(42)
+```
+
+![](logo.png)
+
+# Introduction
+In this project we try to replicate and extend the example 7.2 in *Bayesan Modelling Using WinBUGS*. The [data](https://www.football-data.co.uk/italym.php) are the one related to the season 2020-2021 of the Italian *Serie A*. 
+We have $K=20$ different teams and $N = K(K-1)=380$ records of football matches along the season. We will consider only a few columns of the original dataset:
+
+- `HomeTeam`: team that played home in that match
+- `AwayTeam`: team that played away in that match
+- `FTHG`: scored goals by the home team
+- `FTAG`: scored goals by the away team
+
+```{r}
+data <- read.csv('I1.csv')
+
+df <- select(data, 'HomeTeam', 'AwayTeam', 'FTHG', 'FTAG')
+
+df$HomeTeam <- as.factor(df$HomeTeam)
+df$AwayTeam <- as.factor(df$AwayTeam)
+teams <- sort(unique(df$HomeTeam))
+
+str(df)
+```
+
+```{r echo=FALSE}
+
+par(mfrow=c(1,2))
+barplot(prop.table(table(df$FTHG)),
+        col = 'dodgerblue3', main='Home goals (FTHG)')
+barplot(prop.table(table(df$FTAG)), 
+        col = 'dodgerblue3', main='Away goals (FTAG)')
+
+```
+
+# The Model
+In this model proposed by Maher (1982) we denote by $y_{ij}$ the number of goals scored in the $i$-th match by the home teams if $j=1$ or the away teams if $j=2$. The model is called *Poisson log-linear* since the link function is logarithmic:
+$$ \begin{align*} Y_{ij}&\sim \text{Pois}(\lambda_{ik})  \quad & \text{for} \;j=1,2 \quad k=1,\dots ,K \\ \log(\lambda_{i1}) & =\mu+\text{home} +a_{HT_i}+d_{AT_i} \\ \log(\lambda_{i2}) &= \mu   + a_{AT_i}+d_{HT_i} \quad& \text{for} \;  i=1,\dots,N \end{align*}$$
+where $\text{home}$ is a parameter that takes in to account the advantage of playing home, $a_k$ and $d_k$ are respectively attacking and defensive parameters for each team. On these two we use sum-to-zero constraints:
+$$ \sum_{k=1}^K a_k = 0 \quad \sum_{k=1}^K d_k=0$$
+Notice that an $a>0$ means that the team scores more than the average, while for $d$ is the opposite: good defensive performances are related to negative defensive parameters. We choose for the parameter the same normal prior distribution with high variance
+
+$$\mu,\text{home},a_k,d_k \sim \mathcal N(0, 1\times10^4) \quad  k=1,\dots,K $$
+
+```{r cache=TRUE}
+
+model <-function(){
+  # Likelihood
+  for (i in 1:N){
+    goals1[i] ~ dpois( lambda1[i] )
+    goals2[i] ~ dpois( lambda2[i] )
+    
+    # Link
+    log(lambda1[i]) <- mu + home + a[ ht[i] ] + d[ at[i] ]
+    log(lambda2[i]) <- mu        + a[ at[i] ] + d[ ht[i] ]
+  }
+  
+  #  Sum-to-zero constraints
+  a[1] <- -sum( a[2:K] )
+  d[1] <- -sum( d[2:K] )
+  
+  # Priors  
+  mu   ~ dnorm(0, 1.0E-4)
+  home ~ dnorm(0, 1.0E-4)
+  
+  for (i in 2:K){
+    a[i] ~ dnorm(0, 1.0E-4)
+    d[i] ~ dnorm(0, 1.0E-4)
+  }
+  
+  # League Replication
+  for (i in 1:K){
+    for (j in 1:K){
+      # In this case we are simulating also the games played
+      # against itself (i=j). Those will be removed later
+      goals1.rep[i,j] ~ dpois(lambda1.rep[i,j])
+      goals2.rep[i,j] ~ dpois(lambda2.rep[i,j])
+      
+      # Here we use the parameters found before
+      log(lambda1.rep[i,j]) <-  mu + home + a[ i ] + d[ j ]
+      log(lambda2.rep[i,j]) <-  mu        + a[ j ] + d[ i ]
+      
+      # replicated difference
+      goal.diff.rep[i,j] <- goals1.rep[i,j]-goals2.rep[i,j] 
+    }
+  }
+  for (i in 1:K){
+    for (j in 1:K){
+      # points earned by each home team (i)
+      ## step(x) = 1 if x >= 0, 0 otherwise
+      ## equals(x,y) = 1 if x == y
+      points1[i,j] <- 3*(1-step(-goal.diff.rep[i,j])) +
+        1*equals(goal.diff.rep[i,j],0)
+      # points earned by each away team (j)
+      points2[i,j] <- 3*(1-step( goal.diff.rep[i,j])) +
+        1*equals(goal.diff.rep[i,j],0)
+    }
+  }
+  for (i in 1:K){
+    # Sum of the points in home games + sum of away games
+    # minus the games with itself
+    total.points[i] <- sum(points1[i,1:K]) - points1[i,i] +
+      sum(points2[1:K,i]) - points2[i,i] 
+  }
+  
+  # Ranking 
+  for (i in 1:K){ 
+    # The rank for team i is 21 - the number of teams that have 
+    # less point than i - 1 (itself)
+    ranks[i] <- K + 1 - sum(total.points[i] >= total.points) - 1
+  }
+  for (i in 1:K){
+    for (j in 1:K){
+      
+      rank.probs[i,j] <- equals( ranks[i], j )
+    }
+  } 
+}
+
+
+N <- nrow(df)
+K <- length(teams) 
+  
+dat.jags <- list("goals1" = df$FTHG, "goals2" = df$FTAG, 
+                 "ht" = df$HomeTeam, "at" = df$AwayTeam,
+                 "N" = N, "K" = K)
+
+mod.params <- c("mu", "home", "a", "d", "ranks", 
+                "rank.probs","total.points",
+                "goals1.rep", "goals2.rep")
+ 
+
+mod.fit <- jags(model.file = model,
+                n.chains = 3,
+                data = dat.jags,
+                parameters.to.save = mod.params,
+                n.iter = 9000, n.burnin = 1000, n.thin=10)
+
+```
+
+```{r}
+results <- data.frame(teams,
+                  round(mod.fit$BUGSoutput$mean$a,3),
+                  round(mod.fit$BUGSoutput$mean$d,3),
+                  round(mod.fit$BUGSoutput$mean$ranks,3),
+                  round(mod.fit$BUGSoutput$mean$total.points,3))
+
+colnames(results) <- c('teams', 'a', 'd',
+                       'rank', 'scores')
+
+actual.scores <- c(78, 33, 41, 37, 23, 40, 42, 91, 78, 68, 79, 77,
+                   20, 62, 52, 62, 39, 37, 40, 45)
+
+results$real.scores <- actual.scores
+
+ord <- sort(results$real.scores, decreasing = T, index.return=T)
+results <- results[ord$ix,]
+
+results$abs.score.err <- round(abs(results$scores -
+                                     results$real.scores),3)
+
+row.names(results) <- NULL
+results
+```
+
+We can compare the simulated ranking with the actual ranking using the Kendall's tau
+
+```{r}
+
+simulated.rank <- rank(results$scores)[K:1]
+actual.rank <- seq(1,20,1)
+cor(simulated.rank, actual.rank, method = 'kendall')
+
+```
+
+### Model Diagnostics
+
+In order to have a sense of how the chains have converged, we can use the *Geweke's convergence diagnostic*. We plot below the parameters with best and worse convergence according to this diagnostic, together with their auto correlation plots. In general, $|Z|>2$ means that the chain has not converged very well, and that seems to be the case for the second parameter. However, we can see in the auto correlation plots that the `ac` is stable around 0 for both parameters (good sign). 
+
+```{r echo=FALSE, cache=TRUE}
+
+#chainArray <- mod.fit$BUGSoutput$sims.array
+chainMat <- mod.fit$BUGSoutput$sims.matrix
+coda.fit <- coda::as.mcmc(mod.fit)
+gewek <- coda::geweke.diag(coda.fit)
+
+par(mfrow=c(1,2))
+colors <- viridis(3, alpha = 0.8)
+
+running_means <- function(vec) cumsum(vec)/(1:length(vec))
+
+worse.val <- max(abs(gewek[[1]]$z), na.rm=T)
+worse <- names(which(abs(gewek[[1]]$z) == worse.val))
+
+best.val <- min(abs(gewek[[1]]$z), na.rm=T)
+best <-  names(which(abs(gewek[[1]]$z) == best.val))[1]
+
+plot(running_means(chainMat[1:800, best]),
+     type = 'l', main = paste('|Z-score|: ', best.val), col = colors[1],
+     ylab = paste('Rolling means of', best))
+lines(running_means(chainMat[801:1600, best]),
+      type = 'l', col = colors[2])
+lines(running_means(chainMat[1601:2400, best]),
+      type = 'l', col = colors[3])
+grid()
+plot(running_means(chainMat[1:800, worse]),
+     type = 'l', main = paste('|Z-score|: ', round(worse.val,3)),  col = colors[1],
+     ylab = paste('Rolling means of', worse))
+lines(running_means(chainMat[801:1600, worse]),
+      type = 'l', col = colors[2])
+lines(running_means(chainMat[1601:2400, worse]),
+      type = 'l', col = colors[3])
+grid()
+
+bayesplot::mcmc_acf(chainMat[,c(best,worse)])
+
+```
+
+Below we show an example of parameter with high auto correlation and one with low. In order to catch them we compare their *effective sample size*. 
+
+```{r, cache=TRUE}
+ess <- effectiveSize(coda.fit)[1:41]
+
+low <- names(which(ess[1:41] == max(ess[1:41])))
+high <- names(which(ess[1:41] == min(ess[1:41])))
+
+bayesplot::mcmc_acf(chainMat[,c(low, high)])
+
+```
+
+The parameter `r high` (on the right) is the one with smallest `ess`, and as we can see its autocorrelation is almost always positive. 
+
+### Prediction 
+
+We can see in the following the HPD intervals for some of the parameters. It is interesting to notice how, in the last plot, the first 5 teams (European competitions zone) seems to have a clear separation from the others in terms of points. This happens (in the opposite sense) also for the last 3 teams (demotion to *Serie B* zone). 
+
+```{r echo=FALSE}
+
+a.chains <- as.mcmc(chainMat)[,1:20]
+a.chains.medians <- apply(a.chains, MARGIN=2, FUN=median)
+idx = sort(a.chains.medians, decreasing = T, index.return=T)
+
+colnames(a.chains) <- teams 
+caterpillar.plot(a.chains[,idx$ix] , Title = 'Attack parameters 95% HPDs')
+
+d.chains <- as.mcmc(chainMat)[,21:40]
+d.chains.medians <- apply(d.chains, MARGIN=2, FUN=median)
+idx = sort(d.chains.medians, decreasing = F, index.return=T)
+
+colnames(d.chains) <- teams 
+caterpillar.plot(d.chains[,idx$ix] , Title = 'Defense parameters 95% HPDs')
+          
+
+rank.chains <- as.mcmc(chainMat[,grep('total.points', colnames(chainMat))])
+rank.chains.medians <- apply(rank.chains, MARGIN=2, FUN=median)
+idx = sort(rank.chains.medians, decreasing = T, index.return=T)
+
+colnames(rank.chains) <- teams 
+caterpillar.plot(rank.chains[,idx$ix] , Title = 'Points 95% HPDs')
+```
+
+We might be interested also in seeing if the parameter $\text{home}$ is significantly greater than 0 (i.e: there is a true advantage in playing as home team). We can do this by performing a classical hypothesis testing procedure:
+
+$$\begin{cases} H_0: \text{home}\ge0 \\H_1:\text{home}<0\end{cases}$$
+In order to do this we compute the Bayes factor
+
+```{r}
+
+mu.home <- mod.fit$BUGSoutput$mean$home
+sd.home <- mod.fit$BUGSoutput$sd$home
+
+ph0_prior <-  pnorm(0, mean=0, sd=1.0E-4, lower.tail = F)
+ph1_prior <-  pnorm(0, mean=0, sd=1.0E-4)
+prior_odds <- ph0_prior/ph1_prior
+
+ph0_post <-  pnorm(0, mean=mu.home, sd=sd.home, lower.tail = F)
+ph1_post <-  pnorm(0, mean=mu.home, sd=sd.home)
+post_odds <- ph0_post/ph1_post
+
+bf <- round(post_odds/prior_odds,1)
+bf
+  
+```
+A Bayes factor of `r bf` means *strong* support in favor of $H_0$, so we can conclude that there is a relevant advantage in playing as home team under our model assumptions. 
+
+### Recover parameters with simulated data
+
+In this part of the analysis we try to use the same model on the simulated data from before, in order to check if we are able to recover the *true* (in the simulated world) parameters. 
+
+```{r}
+## Build data
+goal1.mat <- mod.fit$BUGSoutput$mean$goals1.rep
+rownames(goal1.mat) <- teams
+colnames(goal1.mat) <- teams
+goal1.df <- melt(goal1.mat)
+colnames(goal1.df) = c('HomeTeam', 'AwayTeam', 'FTHG')
+
+goal2.mat <- mod.fit$BUGSoutput$mean$goals2.rep
+rownames(goal2.mat) <- teams
+colnames(goal2.mat) <- teams
+goal2.df <- melt(goal2.mat)
+colnames(goal2.df) = c('HomeTeam', 'AwayTeam', 'FTAG')
+
+df.final <- data.frame(goal1.df$HomeTeam, goal1.df$AwayTeam, 
+                       goal1.df$FTHG, goal2.df$FTAG)
+colnames(df.final)<- c('HomeTeam', 'AwayTeam', 'FTHG', 'FTAG')
+df.final <- df.final[(df.final$HomeTeam != df.final$AwayTeam),]
+
+# Goals must be integer in order to use Poisson
+df.final$FTHG <- round(df$FTHG, 1)
+df.final$FTAG <- round(df$FTAG, 1)
+
+```
+
+
+```{r, cache=T}
+## Model 
+model.new <-function(){
+  ## sampling
+  for (i in 1:N){
+    goals1[i] ~ dpois( lambda1[i] )
+    goals2[i] ~ dpois( lambda2[i] )
+    
+    log(lambda1[i]) <- mu + home + a[ ht[i] ] + d[ at[i] ]
+    log(lambda2[i]) <- mu        + a[ at[i] ] + d[ ht[i] ]
+  }
+  
+  #  Sum-to-zero constraints
+  a[1] <- -sum( a[2:K] )
+  d[1] <- -sum( d[2:K] )
+  
+  mu   ~ dnorm(0, 1.0E-4)
+  home ~ dnorm(0, 1.0E-4)
+  
+  for (i in 2:K){
+    a[i] ~ dnorm(0, 1.0E-4)
+    d[i] ~ dnorm(0, 1.0E-4)
+  }
+}
+
+dat.jags <- list("goals1" = df.final$FTHG, "goals2" = df.final$FTAG, 
+                 "ht" = df.final$HomeTeam, "at" = df.final$AwayTeam,
+                 "N" = N, "K" = K)
+
+mod.params <- c("mu", "home", "a", "d")
+
+
+mod.fit.sim <- jags(model.file = model.new,
+                n.chains = 3,
+                data = dat.jags,
+                parameters.to.save = mod.params,
+                n.iter = 9000, n.burnin = 1000, n.thin=10)
+```
+
+```{r}
+results.2 <- data.frame(teams,
+                  round(mod.fit.sim$BUGSoutput$mean$a,3),
+                  round(mod.fit.sim$BUGSoutput$mean$d,3),
+                  round(mod.fit$BUGSoutput$mean$a,3),
+                  round(mod.fit$BUGSoutput$mean$d,3))
+
+colnames(results.2 ) <- c('teams', 'a', 'd', 'a.new', 'd.new')
+
+results.2$a.abs.diff <- abs(results.2$a - results.2$a.new)
+results.2$b.abs.diff <- abs(results.2$d - results.2$d.new)
+
+results.2
+```
+
+In the table above we compare only the attack and defense parameters. We can see from the columns of the absolute differences that the model can recover the original parameter quite decently, since they are all $<1$. 
+
+# Alternative Model 
+The Poisson distribution has the property of having mean and variance both equal to its parameter $\lambda$. If we want to model the variance of the response variable independently from its mean we could consider the Negative Binomial Distribution: 
+$$\begin{align}  
+Y_{ij} & \sim  \text{NB}(p_{ik},r_j) \quad & \text{for} \;j=1,2 \quad k=1,\dots ,K \\
+p_{ij} &= \frac{r_j}{r_j+\lambda_{ik}} \\ \log(\lambda_{i1}) & =\mu+\text{home} +s_{HT_i}-s_{AT_i} \\ \log(\lambda_{i2}) &= \mu   + s_{AT_i}-s_{HT_i} \quad& \text{for} \;  i=1,\dots,N
+\end{align}$$
+
+We also substituted the attack and defense parameters with an overall *strength* score $s_k$ (with the usual STZ constraint). The prior distributions for the parameters are
+$$ \begin{align} \mu,\text{home},s_k &\sim \mathcal N(0, 1\times10^4) &\quad  k=1,\dots,K \\ r_j&\sim\text{Unif}(0,50) &\quad j=1,2\end{align}$$
+
+```{r, cache=T}
+
+model.alt <-function(){
+  ## sampling
+  for (i in 1:N){
+    goals1[i] ~ dnegbin( p1[i], r1 )
+    goals2[i] ~ dnegbin( p2[i], r2 )
+    
+    p1[i] <- r1/(r1 + lambda1[i])
+    p2[i] <- r2/(r2 + lambda2[i])
+    
+    log(lambda1[i]) <- mu + home + s[ ht[i] ] - s[ at[i] ]
+    log(lambda2[i]) <- mu        + s[ at[i] ] - s[ ht[i] ]
+  }
+  
+  #  Sum-to-zero constraints
+  s[1] <- -sum( s[2:K] )
+  
+  mu   ~ dnorm(0, 1.0E-4)
+  home ~ dnorm(0, 1.0E-4)
+  
+  r1 ~ dunif(0,50)
+  r2 ~ dunif(0,50)
+  
+  for (i in 2:K){
+    s[i] ~ dnorm(0, 1.0E-4)
+  }
+}
+
+N <- nrow(df)
+K <- length(teams) 
+
+dat.jags <- list("goals1" = df$FTHG, "goals2" = df$FTAG, 
+                 "ht" = df$HomeTeam, "at" = df$AwayTeam,
+                 "N" = N, "K" = K)
+
+mod.params <- c("mu", "home", "s", "r1", "r2")
+
+mod.fit.alt <- jags(model.file = model.alt,
+                n.chains = 3,
+                data = dat.jags,
+                parameters.to.save = mod.params,
+                n.iter = 9000, n.burnin = 1000, n.thin=10)
+```
+
+```{r echo=FALSE}
+ranked.teams <- results$teams
+results.alt <- data.frame(teams, 
+                          mod.fit.alt$BUGSoutput$mean$s) #,ranked.teams)
+                      
+colnames(results.alt) <- c('team','strength')
+ord <- sort(results.alt$strength, decreasing = T, index.return=T)
+results.alt <- results.alt[ord$ix,]
+
+results.alt
+
+```
+
+In order to compare the two models we can use the *deviance information criterion* (DIC): for the Poisson model we have a DIC value of `r round(mod.fit$BUGSoutput$DIC, 2)`, while for the Negative Binomial Model the value is `r round(mod.fit.alt$BUGSoutput$DIC,2)`. According to this measure, the model that fits better seems to be the Negative Binomial, in fact, even if the mean deviance is lower for the first model (`r round(mod.fit$BUGSoutput$mean$deviance,2)` vs `r round(mod.fit.alt$BUGSoutput$mean$deviance,2)`), the number of parameters of the latter is *much* smaller (`r round(mod.fit.alt$BUGSoutput$pD,2)` vs `r round(mod.fit$BUGSoutput$pD,2)`) and the DIC penalizes the higher number of parameters.
